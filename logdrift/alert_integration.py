@@ -1,76 +1,85 @@
-"""Integration helpers: poll aggregator, throttle, alert, and summarise."""
+"""High-level polling loop: aggregate → deduplicate → throttle → alert."""
 
 from __future__ import annotations
 
 import time
-import logging
 from typing import Optional
 
 from logdrift.aggregator import LogAggregator
-from logdrift.throttle import AnomalyThrottle
-from logdrift.baseline import BaselineStore
 from logdrift.alert import AlertDispatcher
+from logdrift.baseline import BaselineStore
+from logdrift.dedup import AnomalyDeduplicator, DedupConfig
 from logdrift.summary import SummaryBuilder
-
-logger = logging.getLogger(__name__)
+from logdrift.throttle import AnomalyThrottle, ThrottleConfig
 
 
 def poll_and_alert(
     aggregator: LogAggregator,
     dispatcher: AlertDispatcher,
     throttle: Optional[AnomalyThrottle] = None,
+    deduplicator: Optional[AnomalyDeduplicator] = None,
+    baseline: Optional[BaselineStore] = None,
     summary_builder: Optional[SummaryBuilder] = None,
 ) -> int:
-    """Poll the aggregator once, filter through throttle, fire alerts.
-
-    Returns the number of events dispatched.
-    """
+    """Run one poll cycle.  Returns the number of alerts dispatched."""
     events = aggregator.poll_once()
 
+    if not events:
+        return 0
+
+    # Deduplication (new step, applied before throttle)
+    if deduplicator is not None:
+        events = deduplicator.filter(events)
+
+    if not events:
+        return 0
+
+    # Baseline filtering
+    if baseline is not None:
+        novel = [e for e in events if not baseline.is_known(e.pattern_name, e.line)]
+        for e in novel:
+            baseline.record(e.pattern_name, e.line)
+        events = novel
+
+    if not events:
+        return 0
+
+    # Throttle
     if throttle is not None:
         events = throttle.filter(events)
 
+    if not events:
+        return 0
+
+    # Summary tracking
     if summary_builder is not None:
-        for ev in events:
-            summary_builder.add(ev)
+        for e in events:
+            summary_builder.add(e)
 
-    if events:
-        dispatcher.send(events)
-        logger.debug("Dispatched %d anomaly event(s).", len(events))
-
+    dispatcher.send(events)
     return len(events)
 
 
 def run_loop(
     aggregator: LogAggregator,
     dispatcher: AlertDispatcher,
-    throttle: Optional[AnomalyThrottle] = None,
-    poll_interval: float = 5.0,
-    summary_interval: float = 300.0,
-    summary_builder: Optional[SummaryBuilder] = None,
+    interval: float = 5.0,
+    throttle_config: Optional[ThrottleConfig] = None,
+    dedup_config: Optional[DedupConfig] = None,
+    baseline: Optional[BaselineStore] = None,
 ) -> None:  # pragma: no cover
-    """Run the poll-alert loop indefinitely.
-
-    Logs a periodic summary when *summary_builder* is provided.
-    """
-    last_summary = time.monotonic()
-
-    logger.info(
-        "logdrift loop started (poll=%.1fs, summary=%.1fs)",
-        poll_interval,
-        summary_interval,
-    )
+    """Block forever, polling on *interval* seconds."""
+    throttle = AnomalyThrottle(throttle_config) if throttle_config else None
+    deduplicator = AnomalyDeduplicator(dedup_config) if dedup_config else AnomalyDeduplicator()
+    summary = SummaryBuilder()
 
     while True:
-        try:
-            poll_and_alert(aggregator, dispatcher, throttle, summary_builder)
-        except Exception:  # noqa: BLE001
-            logger.exception("Error during poll cycle.")
-
-        now = time.monotonic()
-        if summary_builder is not None and (now - last_summary) >= summary_interval:
-            report = summary_builder.build()
-            logger.info("\n%s", report)
-            last_summary = now
-
-        time.sleep(poll_interval)
+        poll_and_alert(
+            aggregator,
+            dispatcher,
+            throttle=throttle,
+            deduplicator=deduplicator,
+            baseline=baseline,
+            summary_builder=summary,
+        )
+        time.sleep(interval)
