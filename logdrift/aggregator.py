@@ -1,16 +1,16 @@
-"""Log aggregator — polls watched files and surfaces anomaly events.
+"""Log aggregator: polls watched files and surfaces anomaly events.
 
-This module is kept in sync with logdrift/throttle.py: when a
-``ThrottleConfig`` is supplied the aggregator will skip events that exceed
-the configured rate limit.
+Extended with optional BaselineStore support so that already-known
+(pattern, file) pairs can be suppressed from the output.
 """
 
 from __future__ import annotations
 
-import datetime
+import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import List, Optional
 
+from logdrift.baseline import BaselineStore
 from logdrift.patterns import PatternRegistry
 from logdrift.watcher import LogFileWatcher
 
@@ -18,78 +18,58 @@ from logdrift.watcher import LogFileWatcher
 @dataclass
 class AnomalyEvent:
     source_file: str
-    pattern_name: str
     line: str
-    line_number: int
-    timestamp: datetime.datetime = field(
-        default_factory=datetime.datetime.utcnow
-    )
+    pattern_name: str
+    timestamp: float = field(default_factory=time.time)
 
-    def __str__(self) -> str:  # pragma: no cover
-        ts = self.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
-        return (
-            f"[{ts}] {self.source_file}:{self.line_number} "
-            f"({self.pattern_name}) {self.line.rstrip()}"
-        )
+    def __str__(self) -> str:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(self.timestamp))
+        return f"[{ts}] {self.source_file} | {self.pattern_name} | {self.line.rstrip()}"
 
 
 class LogAggregator:
-    """Aggregate anomaly events from multiple log files.
-
-    Parameters
-    ----------
-    registry:
-        Pattern registry used to classify log lines.
-    throttle:
-        Optional :class:`~logdrift.throttle.AnomalyThrottle` instance.  When
-        provided, events that exceed the throttle limit are silently dropped
-        before being handed to *on_anomaly*.
-    on_anomaly:
-        Callback invoked for every non-throttled :class:`AnomalyEvent`.
-    """
+    """Aggregate log lines from multiple files and emit AnomalyEvents."""
 
     def __init__(
         self,
-        registry: PatternRegistry,
-        throttle=None,
-        on_anomaly: Optional[Callable[[AnomalyEvent], None]] = None,
+        registry: Optional[PatternRegistry] = None,
+        baseline: Optional[BaselineStore] = None,
+        suppress_known: bool = False,
     ) -> None:
-        self._registry = registry
-        self._throttle = throttle
-        self._on_anomaly = on_anomaly
+        self._registry = registry or PatternRegistry()
         self._watchers: List[LogFileWatcher] = []
-        self.events: List[AnomalyEvent] = []
+        self._baseline = baseline
+        self._suppress_known = suppress_known and baseline is not None
 
     def add_file(self, path: str) -> None:
-        """Register a log file for polling."""
         self._watchers.append(LogFileWatcher(path))
 
     def poll_once(self) -> List[AnomalyEvent]:
-        """Read new lines from all watched files and return new events."""
-        new_events: List[AnomalyEvent] = []
+        """Read new lines from all watched files and return anomaly events."""
+        events: List[AnomalyEvent] = []
         for watcher in self._watchers:
-            for line_no, line in watcher.read_new_lines():
-                matches = self._registry.match(line)
-                for pattern_name in matches:
-                    event = AnomalyEvent(
+            for line in watcher.read_new_lines():
+                matched = self._registry.match(line)
+                if matched is None:
+                    continue
+                if self._suppress_known and self._baseline is not None:
+                    if self._baseline.is_known(matched.name, watcher.path):
+                        self._baseline.record(matched.name, watcher.path)
+                        continue
+                if self._baseline is not None:
+                    self._baseline.record(matched.name, watcher.path)
+                events.append(
+                    AnomalyEvent(
                         source_file=watcher.path,
-                        pattern_name=pattern_name,
                         line=line,
-                        line_number=line_no,
+                        pattern_name=matched.name,
                     )
-                    if self._throttle is not None:
-                        if not self._throttle.should_emit(event):
-                            continue
-                    new_events.append(event)
-                    self.events.append(event)
-                    if self._on_anomaly is not None:
-                        self._on_anomaly(event)
-        return new_events
+                )
+        return events
 
-    def run(self, interval: float = 1.0) -> None:  # pragma: no cover
-        """Poll indefinitely, sleeping *interval* seconds between polls."""
-        import time
-
+    def poll_loop(self, interval: float = 1.0) -> None:  # pragma: no cover
+        """Block forever, printing events as they arrive."""
         while True:
-            self.poll_once()
+            for event in self.poll_once():
+                print(event)
             time.sleep(interval)
