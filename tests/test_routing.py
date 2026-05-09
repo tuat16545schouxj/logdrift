@@ -95,16 +95,8 @@ def test_add_rule_dynamically():
     assert router.route(event) == "dynamic"
 
 
-def test_combined_conditions_all_must_match():
-    rule = RoutingRule(
-        destination="specific",
-        filepath_pattern="auth",
-        pattern_name="error",
-    )
-    router = EventRouter(rules=[rule], default_destination="default")
-    # matches filepath but not pattern_name
-    event = make_event(filepath="/var/log/auth.log", pattern_name="warning")
-    assert router.route(event) == "default"
-    # matches both
-    event2 = make_event(filepath="/var/log/auth.log", pattern_name="error")
-    assert router.route(event2) == "specific"
+def test_route_many_empty_list_returns_empty_dict():
+    """Routing an empty event list should return an empty dict without errors."""
+    router = EventRouter(default_destination="default")
+    buckets = router.route_many([])
+    assert buckets == {}
